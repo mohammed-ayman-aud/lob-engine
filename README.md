@@ -1,17 +1,13 @@
 # ITCH order book and matching engine (C++20)
 
-A full-depth limit order book rebuilt from the NASDAQ TotalView-ITCH 5.0 binary feed, plus a
-price-time-priority matching engine on the same data structures and a lock-free SPSC queue that
-connects the feed thread to the book thread. Correctness comes before speed:
+I developed this to investigate how an exchange feed is transformed into an order book and at what speed. It decodes the NASDAQ TotalView-ITCH 5.0 binary feed and re-creates full-depth order books for all stocks. Price-time priority matching is then performed on the same data structures. A lock-free single-producer single-consumer (SPSC) queue facilitates communication between the feed and book threads.
 
-* **Differential testing:** after replaying the same feed, the C++ book matches a deliberately
-  simple Python reference book level for level at full depth (`tools/ref_book.py`).
-* **Fuzzing:** libFuzzer with ASan and UBSan. After every input, the book's whole structure is
-  re-validated (links, level totals, ladder order, leaked orders).
-* **Unit tests** cover each component, including queue-priority rules and the SPSC queue under
-  two threads.
-* **Benchmarks** report p50/p99/p99.9 from per-operation timing, never just a mean, and every
-  optimisation is measured against a baseline.
+Prior to optimizing the order book I ensured that it was valid. Main effort therefore focused on validation:
+
+* **Differential validation.** I constructed a highly simplified Python order book (`tools/ref_book.py`) and validated that the C++ book was identical to this at full depth after replaying the same feed.
+* **Fuzzing.** libFuzzer, ASan and UBSan feed random input to the parser. After each input the whole book is re-validated (checking links, level totals, price ordering and ensuring no orders are leaked).
+* **Unit tests for each component.** This includes the time-priority rules within each price level and dual-thread operation of the SPSC queue.
+* **Benchmarking.** Rather than simply obtaining an average, each individual operation is timed and p50/p99/p99.9 values are derived. All optimizations are benchmarked against a base version.
 
 ```
  ITCH file (mmap, zero-copy)
@@ -24,34 +20,32 @@ connects the feed thread to the book thread. Correctness comes before speed:
                                                          └ asks: Side    Level = FIFO of intrusive Orders
 ```
 
-## Layout
+## What's in here
 
-| Path | What it is |
+| Path | Contents |
 |---|---|
-| `include/lob/itch.hpp` | Zero-copy ITCH 5.0 decoder. Frame lengths are checked against the spec size of every message type, so malformed input returns an error instead of reading past the frame. |
-| `include/lob/book.hpp` | `Order` (48 B, hot fields first), `Level` (intrusive FIFO), and `Side`, which holds a price→level hash map plus a price-sorted ladder with the best price at the back. Includes `validate()`. |
-| `include/lob/book_builder.hpp` | ITCH visitor that maintains every instrument's book: add, execute, cancel, delete and replace (replace loses time priority, per the spec). |
-| `include/lob/matching.hpp` | Matching engine: limit, market and IOC orders and cancels; fills best price first, oldest first. |
-| `include/lob/pool.hpp` | Arena / free-list object pool. No malloc on the hot path after warm-up. |
-| `include/lob/flat_map.hpp` | Open-addressing hash map: linear probing, backward-shift deletion, no tombstones. |
-| `include/lob/spsc.hpp` | Disruptor-style SPSC ring: acquire/release only, padded cache lines, cached peer indices. |
-| `include/lob/histogram.hpp` | Log-linear (HdrHistogram-style) latency histogram, accurate to about 1.6%. |
-| `src/replay.cpp` | CLI: throughput, per-message latency, two-thread pipeline, baseline, book dump. |
-| `bench/` | Matching-engine latency (fast vs baseline) and SPSC vs `std::mutex` queue. |
-| `fuzz/` | libFuzzer harness and minimised corpus (119 inputs). |
-| `tools/gen_itch.py` | Generates spec-exact synthetic ITCH with realistic message ratios. |
-| `tools/ref_book.py` | Python reference book used for the differential tests. |
-| `tools/run_real_data.sh` | Downloads a real NASDAQ day and runs everything, including `perf stat` cache-miss counts. |
+| `include/lob/itch.hpp` | Zero-copy ITCH 5.0 decoder. It verifies that each frame's length is as expected for its message type. Invalid data therefore causes an error rather than reading past the end of the frame. |
+| `include/lob/book.hpp` | Contains an `Order` structure (48 bytes, with the most frequently accessed fields placed first), a `Level` (intrusive FIFO order list) and a `Side` (price-to-level hash map and a price-ordered ladder, with the best price at the back). Also contains `validate()`. |
+| `include/lob/book_builder.hpp` | Processes ITCH messages and applies them to all stocks' books. These messages are for adding, executing, canceling, deleting and replacing. As the specification dictates, a replaced order does not retain its original position in the queue. |
+| `include/lob/matching.hpp` | Matching engine for limit, market and IOC orders and cancellations. Orders are filled first by best price and then by oldest. |
+| `include/lob/pool.hpp` | An object pool with a free list. Once warmed up, nothing on the hot path calls malloc. |
+| `include/lob/flat_map.hpp` | Linear-probing open-addressing hash map. Deletion is via backward shifting (no tombstones). |
+| `include/lob/spsc.hpp` | SPSC ring buffer inspired by the LMAX Disruptor, using acquire/release semantics only. Cache lines are padded and each thread caches the other thread's index. |
+| `include/lob/histogram.hpp` | Self-implemented log-linear latency histogram. Based on HdrHistogram, with about 1.6% precision. |
+| `src/replay.cpp` | Command-line tool for benchmarking throughput, per-message latency and the two-thread pipeline, along with the baseline build and book dump. |
+| `bench/` | Benchmarks for the matching engine (fast vs baseline) and the SPSC queue vs a `std::mutex` queue. |
+| `fuzz/` | libFuzzer harness and a minimized test corpus of 119 inputs. |
+| `tools/gen_itch.py` | Synthetic ITCH generator that follows the specification exactly, with realistic message proportions. |
+| `tools/ref_book.py` | Reference Python book for differential testing. |
+| `tools/run_real_data.sh` | Downloads one real NASDAQ trading day and benchmarks everything on it, including `perf stat` cache-miss statistics. |
 
-## Complexity
+## Speeds
 
-* **Execute, cancel and delete are O(1):** an order-ref hash lookup, then an unlink from an
-  intrusive list.
-* **Adding at an existing price is O(1):** a price→level hash lookup, then an append.
-* **Creating or removing a price level** costs O(log L) to find its slot in the ladder, plus a shift
-  of the levels better than it. That shift is short because activity clusters at the inside.
+* **Order execution, cancellation and deletion are O(1).** This comprises a hash lookup of the order ID and then detaching the order from its level.
+* **Adding at an existing price is also O(1).** This is a hash lookup of the price level, followed by an append to the level.
+* **Creating or deleting a price level** costs O(log L) to locate its position on the price ladder, plus shifting the levels in front of it. Although in theory this shifting could be costly, in practice it is limited because most trading activity occurs near the best price.
 
-## Build and test
+## Building and testing
 
 ```bash
 cmake -S . -B build && cmake --build build -j && ./build/unit_tests      # 44 checks
@@ -60,7 +54,7 @@ python3 tools/gen_itch.py data/small.itch --messages 200000 --stocks 50
 python3 tools/ref_book.py data/small.itch --depth 100000 > py.txt && cmp cpp.txt py.txt   # identical
 ```
 
-Fuzzing needs clang:
+To enable fuzzing you need clang:
 ```bash
 clang++ -std=c++20 -Iinclude -g -O1 -fsanitize=fuzzer,address,undefined fuzz/fuzz_itch.cpp -o fuzz_itch
 ./fuzz_itch fuzz/corpus -max_total_time=600 -max_len=4096
@@ -68,80 +62,52 @@ clang++ -std=c++20 -Iinclude -g -O1 -fsanitize=fuzzer,address,undefined fuzz/fuz
 
 ## Results so far
 
-All numbers below were measured on a **shared 4-vCPU cloud VM** (Xeon @ 2.1 GHz) with no core
-isolation, running **synthetic** ITCH (20M messages, 500 symbols). Raw output is in
-`results/synthetic_vm.txt`. Run `tools/run_real_data.sh` on your own Linux box to get
-real-NASDAQ numbers and `perf` cache counters.
+All data was generated using **synthetic** ITCH (20M messages, 500 stocks) on a **shared 4-core cloud VM** (Xeon @ 2.1 GHz) with no core isolation. The raw results can be seen in `results/synthetic_vm.txt`. Running `tools/run_real_data.sh` on a Linux machine produces real NASDAQ results and `perf stat` cache-miss statistics.
 
 **Correctness:**
 
 | Check | Result |
 |---|---|
 | C++ vs Python reference, full depth, 200k messages | identical (fast, baseline and pipeline builds) |
-| Fuzzing, 10 min, ASan + UBSan + `validate()` after every input | 904,481 inputs, 0 crashes, 0 invariant violations |
-| Line / branch coverage of the parser and book headers, from the fuzz corpus | 96.6% / 91.2% (`llvm-cov`) |
+| Fuzzing for 10 min with ASan + UBSan + `validate()` after every input | 904,481 inputs, 0 crashes, 0 invariant violations |
+| Line / branch coverage of the parser and book headers from the fuzz corpus | 96.6% / 91.2% (`llvm-cov`) |
 
 **Book reconstruction (`replay`):**
 
 | Build | Throughput | Per-message p50 / p99 / p99.9 |
 |---|---|---|
 | pool + flat map | **5.0 M msg/s** (199 ns/msg) | 339 / 847 / 4,287 ns |
-| baseline: `new`/`delete` + `std::unordered_map` | 2.3 M msg/s | 599 / 1,631 / 10,623 ns |
+| baseline: `new`/`delete` + `std::unordered_map` | 2.35 M msg/s | 599 / 1,631 / 10,623 ns |
 
-Per-message latency includes about 20 ns of `rdtsc`/`lfence` overhead. That is why it reads higher
-than the throughput figure, which is untimed.
+Per-message latency incorporates approximately 20 ns of `rdtsc`/`lfence` timing overhead. Hence it reads higher than the throughput figure, which is not timed per message.
 
-**Matching engine (`bench_matching`):** 5M seeded operations, 2.2M fills, each one timed.
+**Matching engine (`bench_matching`):** 5M seeded operations and 2.2M fills, all individually timed.
 
 | Build | p50 | p99 | p99.9 |
 |---|---|---|---|
 | pool + flat map | 103 ns | 419 ns | 639 ns |
-| baseline | 120 ns | 927 ns | 1,743 ns |
+| baseline: `new`/`delete` + `std::unordered_map` | 120 ns | 927 ns | 1,743 ns |
 | **reduction** | 14% | **55%** | **63%** |
 
-The tail is where allocation and node-based hashing hurt: the median barely moves, but p99 is cut
-by more than half.
+While the median changed only slightly, p99 was more than halved. Allocation and node-based hash maps were most detrimental in the tail.
 
 **SPSC ring vs `std::mutex` + `std::deque` (`bench_spsc`):**
 
 | | SPSC ring | mutex queue |
 |---|---|---|
-| Throughput, back to back | 38 to 89 ns/item (varies run to run on this VM) | 239 to 322 ns/item |
-| One-way latency p50, paced | 221 ns | 10,367 ns |
+| Back-to-back throughput, 20M items | 75.8 ns/item (this varied a lot between runs on this VM) | 238.7 ns/item |
+| One-way p50 latency, paced, 1M items | 221 ns | 10,367 ns |
 
-**Findings worth knowing:**
+## What I learned
 
-* **The two-thread pipeline is slower than single-threaded here** (3.35 vs 5.0 M msg/s). Framing a
-  memory-mapped file costs almost nothing, so the hand-off costs more than it saves. The queue pays
-  off when the feed thread has real work, such as socket reads, packet sequencing or gap recovery.
-  Measuring this and saying so is the point.
-* **A negative result:** I tried identity-hashing order refs, which the exchange assigns
-  sequentially, to get cache locality. It made replay **24x slower** (`--identity-hash`): some
-  orders rest all day, so the live refs span more than the table size, wrapped refs collide with
-  those survivors, and linear probing builds huge clusters.
-* **The VM is noisy:** max latencies in the millisecond range are the hypervisor descheduling the
-  vCPU, not the code. Isolated cores (`isolcpus`, `taskset`) would tighten p99.9.
+* **Dual threading was actually slower than single threading** (3.35 vs 5.0 M msg/s). While the cost of splitting frames from a memory-mapped file is negligible, handing them to another thread was more costly. The queue should prove valuable once the feed thread has real work to do, such as socket input, packet sequencing and gap recovery. I had anticipated the reverse and have therefore kept this result in.
+* **A failed approach.** Order IDs are issued sequentially by the exchange, so I attempted to use the order ID's own value as its hash to boost cache locality. However, this slowed replay by about **23x** (0.22 vs 5.02 M msg/s) (still available with `--identity-hash`). Some orders remain on the book all day, so the live order IDs become spread more widely than the table. New IDs wrap around and land on those older orders, and combined with linear probing this causes massive clustering.
+* **The VM is not particularly quiet.** The millisecond-level maximum latencies most likely reflect the hypervisor suspending the virtual CPU, not the code. Pinning threads to dedicated cores (`isolcpus`, `taskset`) should help to tighten p99.9.
 
-## Resume bullets (fill in after `run_real_data.sh`)
+## Next steps
 
-These match what the code actually does. Replace the `[real]` values with your own machine's numbers.
+* Benchmark a full NASDAQ trading day and obtain `perf stat` cache-miss statistics on my own machine.
+* Read the feed from a socket rather than a file, so that the second thread has real work to do.
+* Implement packet gap detection and recovery.
 
-* Built a NASDAQ TotalView-ITCH 5.0 parser and full-depth order book reconstruction in C++20,
-  sustaining [real] M msgs/sec on a full historical trading day (5.0 M/s on synthetic data on a
-  shared VM). Execute, cancel and delete are O(1) via intrusive price levels.
-* Validated the book by differential testing against a Python reference implementation (identical
-  at full depth) and by fuzzing the zero-copy parser with libFuzzer, ASan and UBSan: 900k+ inputs
-  with structural invariant checks and 96.6% line coverage.
-* Implemented a price-time-priority matching engine. A custom arena allocator and an
-  open-addressing hash map cut p99 latency by 55% and p99.9 by 63% vs. `new`/`std::unordered_map`,
-  measured per operation with an HdrHistogram-style histogram on pinned cores.
-* Connected the feed and book threads with a lock-free SPSC ring buffer (acquire/release, padded
-  cache lines): about 3x the throughput of a `std::mutex` queue. Measured where the extra thread
-  helps and where it doesn't.
-
-Notes on the original bullets:
-* The harness is self-written rather than Google Benchmark, and the histogram is HdrHistogram-style
-  rather than the library itself. Either describe it that way or swap the libraries in.
-* Fuzzing found **0** bugs in this run, so don't claim "fixed N edge cases". Claim what is true: the
-  inputs run, the invariants checked and the coverage reached.
-* Cache-miss claims need `perf stat` numbers from your own machine, which `run_real_data.sh` collects.
+I am interested to see how much the tail latency can be reduced by switching to pinned cores, as opposed to a shared VM.
